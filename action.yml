@@ -9,6 +9,7 @@ branding:
   color: yellow
 
 inputs:
+  # Main parameters
   preview-branch:
     description: Branch on which the previews will be deployed.
     required: false
@@ -18,93 +19,34 @@ inputs:
     required: false
     default: pr-preview
   source-dir:
-    description: Directory containing files to deploy.
-    required: false
-    default: .
-  ssh-key:
     description: >
-      This option allows you to define a private SSH key to be used in conjunction with a repository deployment key to deploy using SSH.
-      The private key should be stored in the `secrets / with` menu **as a secret**. The public should be stored in the repositories deployment
-      keys menu and be given write access.
-      Alternatively you can set this field to `true` to enable SSH endpoints for deployment without configuring the ssh client. This can be useful if you've
-      already setup the SSH client using another package or action in a previous step.
+      Directory containing files to deploy.
+
+      Required when deploying a preview; will raise a warning if specified
+      when removing a preview.
     required: false
-
-  token:
-    description: >
-      This option defaults to the repository scoped GitHub Token. 
-      However if you need more permissions for things such as deploying to another repository, you can add a Personal Access Token (PAT) here. 
-      This should be stored in the `secrets / with` menu **as a secret**.
-      We recommend using a service account with the least permissions necessary
-      and when generating a new PAT that you select the least permission scopes required.
-      [Learn more about creating and using encrypted secrets here.](https://help.github.com/en/actions/automating-your-workflow-with-github-actions/creating-and-using-encrypted-secrets)
-    required: false
-    default: ${{ github.token }}
-
-  commit-message:
-    description: 'If you need to customize the commit message for an integration you can do so.'
-    required: false
-
-  clean:
-    description: 'If your project generates hashed files on build you can use this option to automatically delete them from the target folder on the deployment branch with each deploy. This option is on by default and can be toggled off by setting it to false.'
-    required: false
-    default: true
-
-  clean-exclude:
-    description: 'If you need to use clean but you would like to preserve certain files or folders you can use this option. This should contain each pattern as a single line in a multiline string.'
-    required: false
-
-  dry-run:
-    description: 'Do not actually push back, but use `--dry-run` on `git push` invocations instead.'
-    required: false
-
-  force:
-    description: 'Whether to force-push and overwrite any existing deployment. Setting this to false will attempt to rebase simultaneous deployments. This option is on by default and can be toggled off by setting it to false.'
-    required: false
-    default: true
-
-  git-config-name:
-    description: 'Allows you to customize the name that is attached to the GitHub config which is used when pushing the deployment commits. If this is not included it will use the name in the GitHub context, followed by the name of the action.'
-    required: false
-
-  git-config-email:
-    description: 'Allows you to customize the email that is attached to the GitHub config which is used when pushing the deployment commits. If this is not included it will use the email in the GitHub context, followed by a generic noreply GitHub email.'
-    required: false
-
-  repository-name:
-    description: 'Allows you to specify a different repository path so long as you have permissions to push to it. This should be formatted like so: JamesIves/github-pages-deploy-action'
-    required: false
-
-  tag:
-    description: "Add a tag to the commit, this can be used like so: 'v0.1'. Only works when 'dry-run' is not used."
-    required: false
-
-  single-commit:
-    description: "This option can be used if you'd prefer to have a single commit on the deployment branch instead of maintaining the full history."
-    required: false
-
-  silent:
-    description: 'Silences the action output preventing it from displaying git messages.'
-    required: false  
-
+    default: ""
   action:
     description: >
       Determines what this action will do when it is executed. Supported
-      values: `deploy`, `remove`, `auto` (default).
+      values: `deploy`, `remove`.
 
       If set to `deploy`, will attempt to deploy the preview and overwrite
       any existing preview in that location.
 
       If set to `remove`, will attempt to remove the preview in that
       location.
+    required: true
 
-      If set to `auto`, the action will try to determine whether to deploy
-      or remove the preview. It will deploy the preview on
-      `pull_request.types.synchronize` and `.opened` events, and remove it
-      on `pull_request.types.closed` events. It will not do anything for
-      all other events. `auto` is the default value.
+  # Parameters for simulating a pull request
+  pr-number:
+    description: >
+      The number of the PR to comment on when updating the preview
+      deployment. If the initiating event is `pull_request` or
+      `pull_request_target`, defaults to the number of the initiating PR.
+      Required otherwise.
     required: false
-    default: auto
+    default: ${{ github.event.number }}
 
 outputs:
   deployment-url:
@@ -114,38 +56,61 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Store environment variables
+    - name: Store environment variables and validate inputs
       env:
         action: ${{ inputs.action }}
         umbrella: ${{ inputs.umbrella-dir }}
-        pr: ${{ github.event.number }}
+        source_dir: ${{ inputs.source-dir }}
+        pr: ${{ inputs.pr-number }}
         actionref: ${{ github.action_ref }}
         actionrepo: ${{ github.action_repository }}
       run: |
-        echo "action=$action" >> $GITHUB_ENV
-        echo "targetdir=$umbrella/pr-$pr" >> $GITHUB_ENV
-        echo "pr=$pr" >> $GITHUB_ENV
+        if [ -z "$action" ]; then
+          echo "::error::Action input is required (deploy/remove)" >&2
+          exit 1
+        fi
+
+        if [ "$action" != "deploy" ] && [ "$action" != "remove" ]; then
+          echo "::error::Unknown action $action" >&2
+          exit 1
+        fi
+
+        if [ "$action" = "deploy" ] && [ -z "$source_dir" ]; then
+          echo "::error::Source dir must be defined when deploying" >&2
+          exit 1
+        fi
+
+        if [ "$action" = "remove" ] && [ -n "$source_dir" ]; then
+          echo "::warning::Source dir should not be defined when removing" >&2
+        fi
+
+        if [ -z "$pr" ]; then
+          echo "::error::PR number required for non-pull_request event" >&2
+          exit 1
+        fi
+
+        echo "action=$action" >> "$GITHUB_ENV"
+
+        echo "targetdir=$umbrella/pr-$pr" >> "$GITHUB_ENV"
+        echo "pr=$pr" >> "$GITHUB_ENV"
 
         pagesurl=$(echo $GITHUB_REPOSITORY | sed 's/\//.github.io\//')
-        echo "pagesurl=$pagesurl" >> $GITHUB_ENV
+        echo "pagesurl=$pagesurl" >> "$GITHUB_ENV"
 
+        echo "emptydir=$(mktemp -d)" >> "$GITHUB_ENV"
+        echo "datetime=$(date '+%Y-%m-%d %H:%M %Z')" >> "$GITHUB_ENV"
 
-        echo "emptydir=$(mktemp -d)" >> $GITHUB_ENV
-        echo "datetime=$(date '+%Y-%m-%d %H:%M %Z')" >> $GITHUB_ENV
-
-        echo "actionref=$actionref" >> $GITHUB_ENV
-        echo "actionrepo=$actionrepo" >> $GITHUB_ENV
+        echo "actionref=$actionref" >> "$GITHUB_ENV"
+        echo "actionrepo=$actionrepo" >> "$GITHUB_ENV"
       shell: bash
 
     - name: Determine action version
-      run: >-
-        ${{ github.action_path }}/lib/find-current-git-tag.sh
-        -p $actionrepo -f $actionref
-      shell: bash
-
-    - name: Determine auto action
-      if: env.action == 'auto'
-      run: ${{ github.action_path }}/lib/determine-auto-action.sh
+      run: |
+        version=$(
+          "${{ github.action_path }}/lib/find-current-git-tag.sh" \
+          -p $actionrepo -f $actionref
+        )
+        echo "action_version=$version" >> "$GITHUB_ENV"
       shell: bash
 
     - name: Deploy preview directory
@@ -170,6 +135,7 @@ runs:
       uses: marocchino/sticky-pull-request-comment@v2
       with:
         header: pr-preview
+        number: ${{ env.pr }}
         message: "\
           [PR Preview Action]\
           (${{ github.server_url }}/${{ env.actionrepo }})
@@ -177,7 +143,7 @@ runs:
 
           :---:
 
-          :rocket: Deployed preview to
+          🛫 Deployed preview to
           https://${{ env.pagesurl }}/${{ env.targetdir }}/
 
           on branch [`${{ inputs.preview-branch }}`](\
@@ -201,6 +167,7 @@ runs:
       uses: marocchino/sticky-pull-request-comment@v2
       with:
         header: pr-preview
+        number: ${{ env.pr }}
         message: "\
           [PR Preview Action]\
           (${{ github.server_url }}/${{ env.actionrepo }})
@@ -208,7 +175,7 @@ runs:
 
           :---:
 
-          Preview removed because the pull request was closed.
+          🛬 Preview removed because the pull request was closed.
 
           ${{ env.datetime }}
           "
